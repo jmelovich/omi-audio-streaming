@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -18,12 +17,13 @@ import (
 )
 
 const (
-	numChannels   = 1  // Mono audio
+	numChannels   = 1 // Mono audio
+	sampleRate    = 16000
 	bitsPerSample = 16 // 16 bits per sample
 )
 
 // CreateWAVHeader generates a WAV header for the given data length
-func createWAVHeader(dataLength int, sampleRate int) []byte {
+func createWAVHeader(dataLength int) []byte {
 	byteRate := sampleRate * numChannels * bitsPerSample / 8
 	blockAlign := numChannels * bitsPerSample / 8
 	header := make([]byte, 44)
@@ -110,15 +110,6 @@ func handlePostAudio(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Received request from uid: %s", uid)
 	log.Printf("Requested sample rate: %s", sampleRateParam)
 
-	// Parse the sample rate if provided
-	var sampleRateValue int
-	if sampleRateParam != "" {
-		sampleRateValue, err := strconv.Atoi(sampleRateParam)
-		if err != nil || sampleRateValue <= 0 {
-			log.Printf("Invalid sample rate: %s, using default: %d Hz", sampleRateParam, 16000)
-			sampleRateValue = 16000
-		}
-	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
@@ -137,7 +128,7 @@ func handlePostAudio(w http.ResponseWriter, r *http.Request) {
 
 	tempFilePath := filepath.Join(os.TempDir(), filename)
 
-	header := createWAVHeader(len(body), sampleRateValue)
+	header := createWAVHeader(len(body))
 
 	// Write to temporary file
 	tempFile, err := os.Create(tempFilePath)
