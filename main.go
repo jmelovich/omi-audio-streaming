@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -17,12 +17,97 @@ import (
 )
 
 const (
-	numChannels   = 1 // Mono audio
-	sampleRate    = 16000
-	bitsPerSample = 16 // 16 bits per sample
+	numChannels      = 1    // Mono audio
+	sampleRate       = 16000
+	bitsPerSample    = 16   // 16 bits per sample
+	maxDuration      = 5 * time.Minute
+	inactivityLimit  = 2 * time.Minute
+	metadataFile     = "current_wav_metadata.json"
 )
 
-// CreateWAVHeader generates a WAV header for the given data length
+type WAVMetadata struct {
+	Filename      string    `json:"filename"`
+	LastWriteTime time.Time `json:"last_write_time"`
+	CurrentSize   int       `json:"current_size"`
+}
+
+// calculateDuration returns the duration of audio based on size in bytes
+func calculateDuration(sizeInBytes int) time.Duration {
+	bytesPerSecond := sampleRate * numChannels * bitsPerSample / 8
+	seconds := float64(sizeInBytes) / float64(bytesPerSecond)
+	return time.Duration(seconds * float64(time.Second))
+}
+
+// getStorageClient creates a new Google Cloud Storage client
+func getStorageClient(ctx context.Context) (*storage.Client, error) {
+	credsEnv := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+	if credsEnv == "" {
+		return nil, fmt.Errorf("GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable is not set")
+	}
+
+	creds, err := base64.StdEncoding.DecodeString(credsEnv)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode credentials: %v", err)
+	}
+
+	credsFile, err := os.CreateTemp("", "gcs-creds-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file for credentials: %v", err)
+	}
+	defer os.Remove(credsFile.Name())
+
+	if _, err := credsFile.Write(creds); err != nil {
+		return nil, fmt.Errorf("failed to write credentials to temp file: %v", err)
+	}
+	credsFile.Close()
+
+	return storage.NewClient(ctx, option.WithCredentialsFile(credsFile.Name()))
+}
+
+// getCurrentMetadata retrieves the current WAV metadata from GCS
+func getCurrentMetadata(ctx context.Context, bucket *storage.BucketHandle) (*WAVMetadata, error) {
+	obj := bucket.Object(metadataFile)
+	r, err := obj.NewReader(ctx)
+	if err == storage.ErrObjectNotExist {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read metadata: %v", err)
+	}
+	defer r.Close()
+
+	var metadata WAVMetadata
+	if err := json.NewDecoder(r).Decode(&metadata); err != nil {
+		return nil, fmt.Errorf("failed to decode metadata: %v", err)
+	}
+
+	return &metadata, nil
+}
+
+// updateMetadata saves the current WAV metadata to GCS
+func updateMetadata(ctx context.Context, bucket *storage.BucketHandle, metadata *WAVMetadata) error {
+	obj := bucket.Object(metadataFile)
+	writer := obj.NewWriter(ctx)
+	if err := json.NewEncoder(writer).Encode(metadata); err != nil {
+		writer.Close()
+		return fmt.Errorf("failed to encode metadata: %v", err)
+	}
+	return writer.Close()
+}
+
+// shouldCreateNewFile determines if we need to create a new WAV file
+func shouldCreateNewFile(metadata *WAVMetadata) bool {
+	if metadata == nil {
+		return true
+	}
+
+	currentDuration := calculateDuration(metadata.CurrentSize)
+	timeSinceLastWrite := time.Since(metadata.LastWriteTime)
+
+	return currentDuration >= maxDuration || timeSinceLastWrite >= inactivityLimit
+}
+
+// createWAVHeader generates a WAV header for the given data length
 func createWAVHeader(dataLength int) []byte {
 	byteRate := sampleRate * numChannels * bitsPerSample / 8
 	blockAlign := numChannels * bitsPerSample / 8
@@ -47,102 +132,16 @@ func createWAVHeader(dataLength int) []byte {
 	return header
 }
 
-func uploadFileToGCS(bucketName string, fileName string, filePath string) error {
-	ctx := context.Background()
-
-	// Create a storage client using the service account credentials from the environment variable
-	credsEnv := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-	if credsEnv == "" {
-		return fmt.Errorf("GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable is not set")
-	}
-
-	// Decode the base64 encoded credentials
-	creds, err := base64.StdEncoding.DecodeString(credsEnv)
-	if err != nil {
-		return fmt.Errorf("failed to decode credentials: %v", err)
-	}
-
-	// Create a temporary file for the credentials
-	credsFile, err := os.CreateTemp("", "gcs-creds-*.json")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file for credentials: %v", err)
-	}
-	defer os.Remove(credsFile.Name())
-
-	if _, err := credsFile.Write(creds); err != nil {
-		return fmt.Errorf("failed to write credentials to temp file: %v", err)
-	}
-	credsFile.Close()
-
-	// Create a storage client
-	client, err := storage.NewClient(ctx, option.WithCredentialsFile(credsFile.Name()))
-	if err != nil {
-		return fmt.Errorf("failed to create storage client: %v", err)
-	}
-	defer client.Close()
-
-	bucket := client.Bucket(bucketName)
-	f, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to open file: %v", err)
-	}
-	defer f.Close()
-
-	wc := bucket.Object(fileName).NewWriter(ctx)
-	wc.ContentType = "audio/wav"
-
-	if _, err = io.Copy(wc, f); err != nil {
-		return fmt.Errorf("failed to write to bucket: %v", err)
-	}
-	if err := wc.Close(); err != nil {
-		return fmt.Errorf("failed to close Writer: %v", err)
-	}
-
-	log.Printf("File %s uploaded to GCS bucket %s successfully.", fileName, bucketName)
-	return nil
-}
-
 // HandlePostAudio is the Cloud Function entrypoint
 func HandlePostAudio(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+
 	query := r.URL.Query()
 	sampleRateParam := query.Get("sample_rate")
 	uid := query.Get("uid")
 
 	log.Printf("Received request from uid: %s", uid)
 	log.Printf("Requested sample rate: %s", sampleRateParam)
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
-
-	currentTime := time.Now()
-	filename := fmt.Sprintf("%02d_%02d_%04d_%02d_%02d_%02d.wav",
-		currentTime.Day(),
-		currentTime.Month(),
-		currentTime.Year(),
-		currentTime.Hour(),
-		currentTime.Minute(),
-		currentTime.Second())
-
-	tempFilePath := filepath.Join(os.TempDir(), filename)
-
-	header := createWAVHeader(len(body))
-
-	// Write to temporary file
-	tempFile, err := os.Create(tempFilePath)
-	if err != nil {
-		log.Printf("Failed to create temp file: %v", err)
-		http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
-		return
-	}
-	defer tempFile.Close()
-
-	// Write WAV header and audio data
-	tempFile.Write(header)
-	tempFile.Write(body)
 
 	// Get bucket name from environment variable
 	bucketName := os.Getenv("GCS_BUCKET_NAME")
@@ -152,14 +151,137 @@ func HandlePostAudio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upload the file to Google Cloud Storage
-	err = uploadFileToGCS(bucketName, filename, tempFilePath)
+	// Create storage client
+	client, err := getStorageClient(ctx)
 	if err != nil {
-		log.Printf("Failed to upload to GCS: %v", err)
-		http.Error(w, "Failed to upload to Google Cloud Storage", http.StatusInternalServerError)
+		log.Printf("Failed to create storage client: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to create storage client: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer client.Close()
+
+	bucket := client.Bucket(bucketName)
+
+	// Read request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Failed to read request body: %v", err)
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	// Get current metadata
+	metadata, err := getCurrentMetadata(ctx, bucket)
+	if err != nil {
+		log.Printf("Failed to get metadata: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to get metadata: %v", err), http.StatusInternalServerError)
 		return
 	}
 
+	if shouldCreateNewFile(metadata) {
+		// Create new WAV file
+		currentTime := time.Now()
+		filename := fmt.Sprintf("%02d_%02d_%04d_%02d_%02d_%02d.wav",
+			currentTime.Day(),
+			currentTime.Month(),
+			currentTime.Year(),
+			currentTime.Hour(),
+			currentTime.Minute(),
+			currentTime.Second())
+
+		log.Printf("Creating new WAV file: %s", filename)
+
+		// Create new file in GCS
+		obj := bucket.Object(filename)
+		writer := obj.NewWriter(ctx)
+		writer.ContentType = "audio/wav"
+
+		// Write header and body
+		header := createWAVHeader(len(body))
+		if _, err := writer.Write(header); err != nil {
+			writer.Close()
+			log.Printf("Failed to write header: %v", err)
+			http.Error(w, "Failed to write header", http.StatusInternalServerError)
+			return
+		}
+		if _, err := writer.Write(body); err != nil {
+			writer.Close()
+			log.Printf("Failed to write audio data: %v", err)
+			http.Error(w, "Failed to write audio data", http.StatusInternalServerError)
+			return
+		}
+		if err := writer.Close(); err != nil {
+			log.Printf("Failed to close writer: %v", err)
+			http.Error(w, "Failed to close writer", http.StatusInternalServerError)
+			return
+		}
+
+		// Update metadata
+		metadata = &WAVMetadata{
+			Filename:      filename,
+			LastWriteTime: currentTime,
+			CurrentSize:   len(body),
+		}
+	} else {
+		log.Printf("Appending to existing WAV file: %s", metadata.Filename)
+
+		// Read existing file content
+		oldObj := bucket.Object(metadata.Filename)
+		reader, err := oldObj.NewReader(ctx)
+		if err != nil {
+			log.Printf("Failed to read existing file: %v", err)
+			http.Error(w, "Failed to read existing file", http.StatusInternalServerError)
+			return
+		}
+
+		existingContent, err := io.ReadAll(reader)
+		reader.Close()
+		if err != nil {
+			log.Printf("Failed to read existing content: %v", err)
+			http.Error(w, "Failed to read existing content", http.StatusInternalServerError)
+			return
+		}
+
+		// Create new content with updated header
+		newSize := metadata.CurrentSize + len(body)
+		header := createWAVHeader(newSize)
+		
+		// Combine header, existing audio data (excluding old header), and new audio data
+		newContent := make([]byte, 0, len(header)+newSize)
+		newContent = append(newContent, header...)
+		newContent = append(newContent, existingContent[44:]...)
+		newContent = append(newContent, body...)
+
+		// Write new content
+		writer := oldObj.NewWriter(ctx)
+		writer.ContentType = "audio/wav"
+		
+		if _, err := writer.Write(newContent); err != nil {
+			writer.Close()
+			log.Printf("Failed to write new content: %v", err)
+			http.Error(w, "Failed to write new content", http.StatusInternalServerError)
+			return
+		}
+		if err := writer.Close(); err != nil {
+			log.Printf("Failed to close writer: %v", err)
+			http.Error(w, "Failed to close writer", http.StatusInternalServerError)
+			return
+		}
+
+		// Update metadata
+		metadata.CurrentSize = newSize
+		metadata.LastWriteTime = time.Now()
+	}
+
+	// Save metadata
+	if err := updateMetadata(ctx, bucket, metadata); err != nil {
+		log.Printf("Failed to update metadata: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to update metadata: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Successfully processed audio for file: %s", metadata.Filename)
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf("Audio bytes received and uploaded as %s", filename)))
+	w.Write([]byte(fmt.Sprintf("Audio bytes processed for file %s", metadata.Filename)))
 }
