@@ -20,7 +20,7 @@ const (
 	numChannels      = 1    // Mono audio
 	sampleRate       = 16000
 	bitsPerSample    = 16   // 16 bits per sample
-	maxDuration      = 5 * time.Minute
+	maxDuration      = 30 * time.Minute
 	inactivityLimit  = 2 * time.Minute
 	metadataFile     = "current_wav_metadata.json"
 )
