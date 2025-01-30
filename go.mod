@@ -1,4 +1,4 @@
-module websocket-server
+module example.com/receive-audio-bytes
 
 go 1.22.1
 

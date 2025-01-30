@@ -1,4 +1,4 @@
-package main
+package function
 
 import (
 	"context"
@@ -102,7 +102,8 @@ func uploadFileToGCS(bucketName string, fileName string, filePath string) error 
 	return nil
 }
 
-func handlePostAudio(w http.ResponseWriter, r *http.Request) {
+// HandlePostAudio is the Cloud Function entrypoint
+func HandlePostAudio(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	sampleRateParam := query.Get("sample_rate")
 	uid := query.Get("uid")
@@ -161,11 +162,4 @@ func handlePostAudio(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(fmt.Sprintf("Audio bytes received and uploaded as %s", filename)))
-}
-
-func main() {
-	http.HandleFunc("/audio", handlePostAudio)
-	port := "8080"
-	log.Printf("Server starting on port %s...", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
